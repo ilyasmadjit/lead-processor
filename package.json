@@ -1,7 +1,7 @@
 {
   "name": "lead-processor",
   "version": "1.0.0",
-  "description": "Yandex Mail lead processor to Telegram",
+  "description": "LPTracker webhook processor to Telegram",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
@@ -13,8 +13,6 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "imapflow": "^1.0.181",
-    "mailparser": "^3.7.1",
     "node-telegram-bot-api": "^0.65.1",
     "pino": "^9.3.2"
   }
