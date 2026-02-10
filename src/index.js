@@ -1,8 +1,6 @@
 "use strict";
 
 const express = require("express");
-const { ImapFlow } = require("imapflow");
-const { simpleParser } = require("mailparser");
 const TelegramBot = require("node-telegram-bot-api");
 const pino = require("pino");
 require("dotenv").config();
@@ -11,28 +9,12 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const {
   PORT = 3000,
-  IMAP_HOST,
-  IMAP_PORT = 993,
-  IMAP_SECURE = "true",
-  IMAP_USER,
-  IMAP_MAILBOX = "INBOX",
-  IMAP_POLL_INTERVAL_SEC = 30,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID_SHOSSEINAYA,
   TELEGRAM_CHAT_ID_KRASNOKOKSHAYSKAYA,
   TELEGRAM_CHAT_ID_MEREDIANNAYA,
-  LEAD_FROM_FILTER,
-  LEAD_SUBJECT_FILTER,
-  IMAP_PASSWORD,
+  WEBHOOK_SECRET,
 } = process.env;
-
-if (!IMAP_HOST || !IMAP_USER) {
-  logger.warn("IMAP настройки не заданы полностью (IMAP_HOST/IMAP_USER).");
-}
-
-if (!IMAP_PASSWORD) {
-  logger.warn("IMAP пароль приложения не задан (IMAP_PASSWORD).");
-}
 
 if (!TELEGRAM_BOT_TOKEN) {
   logger.warn("TELEGRAM_BOT_TOKEN не задан.");
@@ -43,6 +25,8 @@ const bot = TELEGRAM_BOT_TOKEN
   : null;
 
 const app = express();
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
@@ -69,6 +53,25 @@ function pickChatId(address) {
   return TELEGRAM_CHAT_ID_MEREDIANNAYA;
 }
 
+function payloadToText(payload) {
+  if (payload == null) return "";
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch (err) {
+    return String(payload);
+  }
+}
+
+function splitMessage(text, maxSize = 3500) {
+  const chunks = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    chunks.push(text.slice(cursor, cursor + maxSize));
+    cursor += maxSize;
+  }
+  return chunks;
+}
+
 async function sendToTelegram(text) {
   if (!bot) {
     logger.warn("Telegram bot не настроен, сообщение не отправлено.");
@@ -83,106 +86,43 @@ async function sendToTelegram(text) {
     return;
   }
 
-  const message = text;
-
-  await bot.sendMessage(chatId, message, { disable_web_page_preview: true });
+  const messageChunks = splitMessage(text);
+  for (const chunk of messageChunks) {
+    await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true });
+  }
   logger.info({ addressResolved, chatId }, "Лид отправлен в Telegram");
 }
 
-function matchesFilters(envelope) {
-  if (LEAD_FROM_FILTER && envelope?.from) {
-    const from = envelope.from
-      .map((a) => a.address || "")
-      .join(",")
-      .toLowerCase();
-    if (!from.includes(LEAD_FROM_FILTER.toLowerCase())) return false;
-  }
-
-  if (LEAD_SUBJECT_FILTER && envelope?.subject) {
-    if (
-      !envelope.subject
-        .toLowerCase()
-        .includes(LEAD_SUBJECT_FILTER.toLowerCase())
-    )
-      return false;
-  }
-
-  return true;
+function isAuthorized(req) {
+  if (!WEBHOOK_SECRET) return true;
+  const headerSecret = req.header("x-webhook-secret");
+  const querySecret = req.query?.secret;
+  return headerSecret === WEBHOOK_SECRET || querySecret === WEBHOOK_SECRET;
 }
 
-async function processMessage(client, uid) {
-  const { source, envelope } = await client.fetchOne(uid, {
-    source: true,
-    envelope: true,
-  });
-
-  if (!matchesFilters(envelope)) {
-    logger.info({ uid }, "Письмо не прошло фильтры, пропускаем");
+app.post("/webhook/lptracker", async (req, res) => {
+  if (!isAuthorized(req)) {
+    res.status(401).json({ status: "unauthorized" });
     return;
   }
 
-  const parsed = await simpleParser(source);
-  const text = parsed.text || parsed.html || "";
+  const payload = req.body;
+  const text = payloadToText(payload);
 
   if (!text) {
-    logger.warn({ uid }, "Письмо без текста");
+    res.status(400).json({ status: "empty payload" });
     return;
   }
 
-  await sendToTelegram(text);
-}
-
-async function pollMailbox() {
-  if (!IMAP_HOST || !IMAP_USER || !IMAP_PASSWORD) return;
-
-  const client = new ImapFlow({
-    host: IMAP_HOST,
-    port: Number(IMAP_PORT),
-    secure: IMAP_SECURE === "true",
-    auth: {
-      user: IMAP_USER,
-      pass: IMAP_PASSWORD,
-    },
-  });
-
   try {
-    await client.connect();
-    await client.mailboxOpen(IMAP_MAILBOX);
-
-    const lock = await client.getMailboxLock(IMAP_MAILBOX);
-    try {
-      const searchCriteria = { seen: false };
-      const uids = await client.search(searchCriteria);
-
-      for (const uid of uids) {
-        try {
-          await processMessage(client, uid);
-          await client.messageFlagsAdd(uid, ["\\Seen"]);
-        } catch (err) {
-          logger.error({ err, uid }, "Ошибка обработки письма");
-        }
-      }
-    } finally {
-      lock.release();
-    }
+    await sendToTelegram(text);
+    res.json({ status: "ok" });
   } catch (err) {
-    logger.error({ err }, "Ошибка IMAP");
-  } finally {
-    await client.logout().catch(() => {});
+    logger.error({ err }, "Ошибка отправки в Telegram");
+    res.status(500).json({ status: "error" });
   }
-}
-
-let pollingTimer = null;
-
-function startPolling() {
-  if (pollingTimer) return;
-  const intervalMs = Math.max(Number(IMAP_POLL_INTERVAL_SEC), 10) * 1000;
-
-  pollingTimer = setInterval(pollMailbox, intervalMs);
-  pollMailbox();
-}
+});
 
 app.listen(PORT, () => {
   logger.info({ PORT }, "Service started");
-  startPolling();
 });
