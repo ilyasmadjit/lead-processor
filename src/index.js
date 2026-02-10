@@ -1,185 +1,218 @@
-'use strict';
+"use strict";
 
-const express = require('express');
-const { ImapFlow } = require('imapflow');
-const { simpleParser } = require('mailparser');
-const TelegramBot = require('node-telegram-bot-api');
-const pino = require('pino');
-require('dotenv').config();
+const express = require("express");
+const { ImapFlow } = require("imapflow");
+const { simpleParser } = require("mailparser");
+const TelegramBot = require("node-telegram-bot-api");
+const pino = require("pino");
+require("dotenv").config();
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const {
   PORT = 3000,
   IMAP_HOST,
   IMAP_PORT = 993,
-  IMAP_SECURE = 'true',
+  IMAP_SECURE = "true",
   IMAP_USER,
-  IMAP_PASSWORD,
-  IMAP_MAILBOX = 'INBOX',
+  IMAP_MAILBOX = "INBOX",
   IMAP_POLL_INTERVAL_SEC = 30,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID_SHOSSEINAYA,
   TELEGRAM_CHAT_ID_KRASNOKOKSHAYSKAYA,
   TELEGRAM_CHAT_ID_MEREDIANNAYA,
-  TELEGRAM_MESSAGE_PREFIX = 'Новый лид',
   LEAD_FROM_FILTER,
-  LEAD_SUBJECT_FILTER
+  LEAD_SUBJECT_FILTER,
+  YANDEX_CLIENT_ID,
+  YANDEX_CLIENT_SECRET,
+  YANDEX_REFRESH_TOKEN,
+  YANDEX_OAUTH_TOKEN_URL = "https://oauth.yandex.com/token",
 } = process.env;
 
-if (!IMAP_HOST || !IMAP_USER || !IMAP_PASSWORD) {
-  logger.warn('IMAP настройки не заданы полностью (IMAP_HOST/IMAP_USER/IMAP_PASSWORD).');
+if (!IMAP_HOST || !IMAP_USER) {
+  logger.warn("IMAP настройки не заданы полностью (IMAP_HOST/IMAP_USER).");
+}
+
+if (!YANDEX_CLIENT_ID || !YANDEX_CLIENT_SECRET || !YANDEX_REFRESH_TOKEN) {
+  logger.warn(
+    "OAuth настройки Yandex не заданы полностью (YANDEX_CLIENT_ID/YANDEX_CLIENT_SECRET/YANDEX_REFRESH_TOKEN).",
+  );
 }
 
 if (!TELEGRAM_BOT_TOKEN) {
-  logger.warn('TELEGRAM_BOT_TOKEN не задан.');
+  logger.warn("TELEGRAM_BOT_TOKEN не задан.");
 }
 
-const bot = TELEGRAM_BOT_TOKEN ? new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false }) : null;
+const bot = TELEGRAM_BOT_TOKEN
+  ? new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false })
+  : null;
 
 const app = express();
 
-app.get('/', (req, res) => {
-  res.json({ status: 'ok' });
+app.get("/", (req, res) => {
+  res.json({ status: "ok" });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
 });
-
-function normalizeText(value) {
-  return (value || '').toString().trim();
-}
 
 function detectAddress(summaryText) {
   const text = summaryText.toLowerCase();
 
-  if (text.includes('шоссей')) return 'Шоссейная';
-  if (text.includes('краснококш')) return 'Краснококшайская';
-  if (text.includes('меред') || text.includes('меридиан')) return 'Мередианная';
+  if (text.includes("шоссей")) return "Шоссейная";
+  if (text.includes("краснококш")) return "Краснококшайская";
+  if (text.includes("меред") || text.includes("меридиан")) return "Мередианная";
 
-  return 'Мередианная';
+  return "Мередианная";
 }
 
 function pickChatId(address) {
-  if (address === 'Шоссейная') return TELEGRAM_CHAT_ID_SHOSSEINAYA;
-  if (address === 'Краснококшайская') return TELEGRAM_CHAT_ID_KRASNOKOKSHAYSKAYA;
+  if (address === "Шоссейная") return TELEGRAM_CHAT_ID_SHOSSEINAYA;
+  if (address === "Краснококшайская")
+    return TELEGRAM_CHAT_ID_KRASNOKOKSHAYSKAYA;
   return TELEGRAM_CHAT_ID_MEREDIANNAYA;
 }
 
-function parseLeadFromText(text) {
-  const content = text.replace(/\r\n/g, '\n');
+let oauthCache = {
+  accessToken: null,
+  refreshToken: YANDEX_REFRESH_TOKEN || null,
+  expiresAt: 0,
+};
 
-  const phone = (content.match(/Телефон:\s*([+\d\s()-]+)/i) || [])[1] || 'Не указан';
-  const audio = (content.match(/Запись диалог:\s*(https?:\/\/\S+)/i) || [])[1] || 'Нет';
-  const notifyDate = (content.match(/Дата оповещения\s*([^\n]+)/i) || [])[1] || 'Не указана';
+async function refreshAccessToken() {
+  if (!YANDEX_CLIENT_ID || !YANDEX_CLIENT_SECRET || !oauthCache.refreshToken) {
+    throw new Error("OAuth credentials are missing");
+  }
 
-  const guest = (content.match(/Имя гостя:\s*([^\n]+)/i) || [])[1] || 'Не указано';
-  const address = (content.match(/Адрес:\s*([^\n]+)/i) || [])[1] || 'Не указано';
-  const people = (content.match(/Сколько человек:\s*([^\n]+)/i) || [])[1] || 'Не указано';
-  const dateTime = (content.match(/Дата и время:\s*([^\n]+)/i) || [])[1] || 'Не указано';
-  const hall = (content.match(/Зал:\s*([^\n]+)/i) || [])[1] || 'Не указано';
-  const comments = (content.match(/Дополнительные комментарии:\s*([^\n]+)/i) || [])[1] || 'Не указано';
+  const credentials = Buffer.from(
+    `${YANDEX_CLIENT_ID}:${YANDEX_CLIENT_SECRET}`,
+  ).toString("base64");
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: oauthCache.refreshToken,
+  });
 
-  const summary = [
-    `Имя гостя: ${normalizeText(guest)}`,
-    `Адрес: ${normalizeText(address)}`,
-    `Сколько человек: ${normalizeText(people)}`,
-    `Дата и время: ${normalizeText(dateTime)}`,
-    `Зал: ${normalizeText(hall)}`,
-    `Дополнительные комментарии: ${normalizeText(comments)}`
-  ].join('\n');
+  const response = await fetch(YANDEX_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Basic ${credentials}`,
+    },
+    body,
+  });
 
-  return {
-    phone: normalizeText(phone),
-    audio: normalizeText(audio),
-    notifyDate: normalizeText(notifyDate),
-    summary,
-    address: normalizeText(address),
-    rawComments: normalizeText(comments)
-  };
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`OAuth refresh failed: ${response.status} ${text}`);
+  }
+
+  const data = await response.json();
+
+  oauthCache.accessToken = data.access_token;
+  oauthCache.expiresAt = Date.now() + (Number(data.expires_in) || 0) * 1000;
+
+  if (data.refresh_token && data.refresh_token !== oauthCache.refreshToken) {
+    oauthCache.refreshToken = data.refresh_token;
+    logger.warn(
+      "Yandex refresh_token обновился. Обновите переменную YANDEX_REFRESH_TOKEN в Render.",
+    );
+  }
+
+  return oauthCache.accessToken;
 }
 
-function buildTelegramMessage(lead, addressResolved) {
-  return [
-    `${TELEGRAM_MESSAGE_PREFIX}`,
-    '',
-    `Телефон: ${lead.phone}`,
-    `Запись диалог: ${lead.audio}`,
-    `Дата оповещения: ${lead.notifyDate}`,
-    '',
-    'Резюме диалога:',
-    lead.summary,
-    '',
-    `Адрес (определен): ${addressResolved}`
-  ].join('\n');
+async function getAccessToken() {
+  const now = Date.now();
+  if (oauthCache.accessToken && oauthCache.expiresAt - now > 60_000) {
+    return oauthCache.accessToken;
+  }
+  return refreshAccessToken();
 }
 
-async function sendToTelegram(lead) {
+async function sendToTelegram(text) {
   if (!bot) {
-    logger.warn('Telegram bot не настроен, сообщение не отправлено.');
+    logger.warn("Telegram bot не настроен, сообщение не отправлено.");
     return;
   }
 
-  const combinedAddressSource = `${lead.address} ${lead.rawComments}`.trim().toLowerCase();
-  const addressResolved = detectAddress(combinedAddressSource);
+  const addressResolved = detectAddress(text);
   const chatId = pickChatId(addressResolved);
 
   if (!chatId) {
-    logger.error('Chat ID для адреса не задан, сообщение пропущено.');
+    logger.error("Chat ID для адреса не задан, сообщение пропущено.");
     return;
   }
 
-  const message = buildTelegramMessage(lead, addressResolved);
+  const message = text;
 
   await bot.sendMessage(chatId, message, { disable_web_page_preview: true });
-  logger.info({ addressResolved, chatId }, 'Лид отправлен в Telegram');
+  logger.info({ addressResolved, chatId }, "Лид отправлен в Telegram");
 }
 
 function matchesFilters(envelope) {
   if (LEAD_FROM_FILTER && envelope?.from) {
-    const from = envelope.from.map((a) => a.address || '').join(',').toLowerCase();
+    const from = envelope.from
+      .map((a) => a.address || "")
+      .join(",")
+      .toLowerCase();
     if (!from.includes(LEAD_FROM_FILTER.toLowerCase())) return false;
   }
 
   if (LEAD_SUBJECT_FILTER && envelope?.subject) {
-    if (!envelope.subject.toLowerCase().includes(LEAD_SUBJECT_FILTER.toLowerCase())) return false;
+    if (
+      !envelope.subject
+        .toLowerCase()
+        .includes(LEAD_SUBJECT_FILTER.toLowerCase())
+    )
+      return false;
   }
 
   return true;
 }
 
 async function processMessage(client, uid) {
-  const { source, envelope } = await client.fetchOne(uid, { source: true, envelope: true });
+  const { source, envelope } = await client.fetchOne(uid, {
+    source: true,
+    envelope: true,
+  });
 
   if (!matchesFilters(envelope)) {
-    logger.info({ uid }, 'Письмо не прошло фильтры, пропускаем');
+    logger.info({ uid }, "Письмо не прошло фильтры, пропускаем");
     return;
   }
 
   const parsed = await simpleParser(source);
-  const text = parsed.text || parsed.html || '';
+  const text = parsed.text || parsed.html || "";
 
   if (!text) {
-    logger.warn({ uid }, 'Письмо без текста');
+    logger.warn({ uid }, "Письмо без текста");
     return;
   }
 
-  const lead = parseLeadFromText(text);
-  await sendToTelegram(lead);
+  await sendToTelegram(text);
 }
 
 async function pollMailbox() {
-  if (!IMAP_HOST || !IMAP_USER || !IMAP_PASSWORD) return;
+  if (!IMAP_HOST || !IMAP_USER) return;
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken();
+  } catch (err) {
+    logger.error({ err }, "Не удалось получить OAuth токен для IMAP");
+    return;
+  }
 
   const client = new ImapFlow({
     host: IMAP_HOST,
     port: Number(IMAP_PORT),
-    secure: IMAP_SECURE === 'true',
+    secure: IMAP_SECURE === "true",
     auth: {
       user: IMAP_USER,
-      pass: IMAP_PASSWORD
-    }
+      accessToken,
+      method: "XOAUTH2",
+    },
   });
 
   try {
@@ -194,16 +227,16 @@ async function pollMailbox() {
       for (const uid of uids) {
         try {
           await processMessage(client, uid);
-          await client.messageFlagsAdd(uid, ['\\Seen']);
+          await client.messageFlagsAdd(uid, ["\\Seen"]);
         } catch (err) {
-          logger.error({ err, uid }, 'Ошибка обработки письма');
+          logger.error({ err, uid }, "Ошибка обработки письма");
         }
       }
     } finally {
       lock.release();
     }
   } catch (err) {
-    logger.error({ err }, 'Ошибка IMAP');
+    logger.error({ err }, "Ошибка IMAP");
   } finally {
     await client.logout().catch(() => {});
   }
@@ -220,6 +253,6 @@ function startPolling() {
 }
 
 app.listen(PORT, () => {
-  logger.info({ PORT }, 'Service started');
+  logger.info({ PORT }, "Service started");
   startPolling();
 });
