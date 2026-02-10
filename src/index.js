@@ -23,20 +23,15 @@ const {
   TELEGRAM_CHAT_ID_MEREDIANNAYA,
   LEAD_FROM_FILTER,
   LEAD_SUBJECT_FILTER,
-  YANDEX_CLIENT_ID,
-  YANDEX_CLIENT_SECRET,
-  YANDEX_REFRESH_TOKEN,
-  YANDEX_OAUTH_TOKEN_URL = "https://oauth.yandex.com/token",
+  IMAP_PASSWORD,
 } = process.env;
 
 if (!IMAP_HOST || !IMAP_USER) {
   logger.warn("IMAP настройки не заданы полностью (IMAP_HOST/IMAP_USER).");
 }
 
-if (!YANDEX_CLIENT_ID || !YANDEX_CLIENT_SECRET || !YANDEX_REFRESH_TOKEN) {
-  logger.warn(
-    "OAuth настройки Yandex не заданы полностью (YANDEX_CLIENT_ID/YANDEX_CLIENT_SECRET/YANDEX_REFRESH_TOKEN).",
-  );
+if (!IMAP_PASSWORD) {
+  logger.warn("IMAP пароль приложения не задан (IMAP_PASSWORD).");
 }
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -72,62 +67,6 @@ function pickChatId(address) {
   if (address === "Краснококшайская")
     return TELEGRAM_CHAT_ID_KRASNOKOKSHAYSKAYA;
   return TELEGRAM_CHAT_ID_MEREDIANNAYA;
-}
-
-let oauthCache = {
-  accessToken: null,
-  refreshToken: YANDEX_REFRESH_TOKEN || null,
-  expiresAt: 0,
-};
-
-async function refreshAccessToken() {
-  if (!YANDEX_CLIENT_ID || !YANDEX_CLIENT_SECRET || !oauthCache.refreshToken) {
-    throw new Error("OAuth credentials are missing");
-  }
-
-  const credentials = Buffer.from(
-    `${YANDEX_CLIENT_ID}:${YANDEX_CLIENT_SECRET}`,
-  ).toString("base64");
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: oauthCache.refreshToken,
-  });
-
-  const response = await fetch(YANDEX_OAUTH_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Authorization: `Basic ${credentials}`,
-    },
-    body,
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`OAuth refresh failed: ${response.status} ${text}`);
-  }
-
-  const data = await response.json();
-
-  oauthCache.accessToken = data.access_token;
-  oauthCache.expiresAt = Date.now() + (Number(data.expires_in) || 0) * 1000;
-
-  if (data.refresh_token && data.refresh_token !== oauthCache.refreshToken) {
-    oauthCache.refreshToken = data.refresh_token;
-    logger.warn(
-      "Yandex refresh_token обновился. Обновите переменную YANDEX_REFRESH_TOKEN в Render.",
-    );
-  }
-
-  return oauthCache.accessToken;
-}
-
-async function getAccessToken() {
-  const now = Date.now();
-  if (oauthCache.accessToken && oauthCache.expiresAt - now > 60_000) {
-    return oauthCache.accessToken;
-  }
-  return refreshAccessToken();
 }
 
 async function sendToTelegram(text) {
@@ -194,15 +133,7 @@ async function processMessage(client, uid) {
 }
 
 async function pollMailbox() {
-  if (!IMAP_HOST || !IMAP_USER) return;
-
-  let accessToken;
-  try {
-    accessToken = await getAccessToken();
-  } catch (err) {
-    logger.error({ err }, "Не удалось получить OAuth токен для IMAP");
-    return;
-  }
+  if (!IMAP_HOST || !IMAP_USER || !IMAP_PASSWORD) return;
 
   const client = new ImapFlow({
     host: IMAP_HOST,
@@ -210,8 +141,7 @@ async function pollMailbox() {
     secure: IMAP_SECURE === "true",
     auth: {
       user: IMAP_USER,
-      accessToken,
-      method: "XOAUTH2",
+      pass: IMAP_PASSWORD,
     },
   });
 
