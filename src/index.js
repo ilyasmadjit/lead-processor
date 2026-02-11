@@ -96,6 +96,7 @@ function buildMessage(payload) {
     "",
     "Резюме диалога:",
     "",
+    `Имя гостя: ${resume.name || "—"}`,
     `Адрес: ${address || "—"}`,
     `Сколько человек: ${resume.people || "—"}`,
     `Дата и время: ${resume.dateTime || "—"}`,
@@ -137,6 +138,8 @@ function isAuthorized(req, payload) {
 app.post("/webhook/lptracker", async (req, res) => {
   const payload =
     req.body && Object.keys(req.body).length > 0 ? req.body : req.query;
+
+  logger.info({ payload }, "Webhook payload");
 
   if (!isAuthorized(req, payload)) {
     res.status(401).json({ status: "unauthorized" });
