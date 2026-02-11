@@ -36,13 +36,11 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-function detectAddress(summaryText) {
-  const text = summaryText.toLowerCase();
-
-  if (text.includes("шоссей")) return "Шоссейная";
-  if (text.includes("краснококш")) return "Краснококшайская";
-  if (text.includes("меред") || text.includes("меридиан")) return "Мередианная";
-
+function detectAddress(text) {
+  const value = (text || "").toLowerCase();
+  if (value.includes("шоссей")) return "Шоссейная";
+  if (value.includes("краснококш")) return "Краснококшайская";
+  if (value.includes("меред") || value.includes("меридиан")) return "Мередианная";
   return "Мередианная";
 }
 
@@ -53,32 +51,67 @@ function pickChatId(address) {
   return TELEGRAM_CHAT_ID_MEREDIANNAYA;
 }
 
-function payloadToText(payload) {
-  if (payload == null) return "";
-  try {
-    return JSON.stringify(payload, null, 2);
-  } catch (err) {
-    return String(payload);
-  }
+function normalize(value) {
+  const v = (value || "").toString().trim();
+  return v.length > 0 ? v : "";
 }
 
-function splitMessage(text, maxSize = 3500) {
-  const chunks = [];
-  let cursor = 0;
-  while (cursor < text.length) {
-    chunks.push(text.slice(cursor, cursor + maxSize));
-    cursor += maxSize;
-  }
-  return chunks;
+function parseResume(resumeText) {
+  const text = normalize(resumeText);
+
+  const name =
+    (text.match(/Имя гостя[:\s]+([^\n]+)/i) || [])[1] || "";
+  const people =
+    (text.match(/Сколько человек[:\s]+([^\n]+)/i) || [])[1] || "";
+  const dateTime =
+    (text.match(/Дата и время(?: брони)?[:\s]+([^\n]+)/i) || [])[1] || "";
+  const hall =
+    (text.match(/Зал[:\s]+([^\n]+)/i) || [])[1] || "";
+  const comments =
+    (text.match(/Дополнительн(?:ый|ые) комментарии?[:\s]+([^\n]+)/i) || [])[1] ||
+    "";
+
+  return {
+    name: normalize(name),
+    people: normalize(people),
+    dateTime: normalize(dateTime),
+    hall: normalize(hall),
+    comments: normalize(comments),
+  };
 }
 
-async function sendToTelegram(text) {
+function buildMessage(payload) {
+  const phone = normalize(payload.phone);
+  const linkCall = normalize(payload.link_call);
+  const address = normalize(payload.adress);
+
+  const resume = parseResume(payload.resume);
+
+  return [
+    "Поступил входящий звонок",
+    "",
+    `Телефон: ${phone || "—"}`,
+    "",
+    `Запись диалога: ${linkCall || "—"}`,
+    "",
+    "Резюме диалога:",
+    "",
+    `Имя гостя: ${resume.name || "—"}`,
+    `Адрес: ${address || "—"}`,
+    `Сколько человек: ${resume.people || "—"}`,
+    `Дата и время: ${resume.dateTime || "—"}`,
+    `Зал: ${resume.hall || "—"}`,
+    `Дополнительный комментарии: ${resume.comments || "—"}`,
+  ].join("\n");
+}
+
+async function sendToTelegram(message, addressSource) {
   if (!bot) {
     logger.warn("Telegram bot не настроен, сообщение не отправлено.");
     return;
   }
 
-  const addressResolved = detectAddress(text);
+  const addressResolved = detectAddress(addressSource);
   const chatId = pickChatId(addressResolved);
 
   if (!chatId) {
@@ -86,37 +119,36 @@ async function sendToTelegram(text) {
     return;
   }
 
-  const messageChunks = splitMessage(text);
-  for (const chunk of messageChunks) {
-    await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true });
-  }
+  await bot.sendMessage(chatId, message, { disable_web_page_preview: true });
   logger.info({ addressResolved, chatId }, "Лид отправлен в Telegram");
 }
 
-function isAuthorized(req) {
+function isAuthorized(req, payload) {
   if (!WEBHOOK_SECRET) return true;
   const headerSecret = req.header("x-webhook-secret");
   const querySecret = req.query?.secret;
-  return headerSecret === WEBHOOK_SECRET || querySecret === WEBHOOK_SECRET;
+  const bodySecret = payload?.secret;
+  return (
+    headerSecret === WEBHOOK_SECRET ||
+    querySecret === WEBHOOK_SECRET ||
+    bodySecret === WEBHOOK_SECRET
+  );
 }
 
 app.post("/webhook/lptracker", async (req, res) => {
-  if (!isAuthorized(req)) {
+  const payload =
+    req.body && Object.keys(req.body).length > 0 ? req.body : req.query;
+
+  if (!isAuthorized(req, payload)) {
     res.status(401).json({ status: "unauthorized" });
     return;
   }
 
-  const payload =
-    req.body && Object.keys(req.body).length > 0 ? req.body : req.query;
-  const text = payloadToText(payload);
-
-  if (!text || text === "{}") {
-    res.status(400).json({ status: "empty payload" });
-    return;
-  }
-
   try {
-    await sendToTelegram(text);
+    const message = buildMessage(payload);
+    const addressSource = `${payload.adress || ""} ${payload.resume || ""}`;
+
+    await sendToTelegram(message, addressSource);
     res.json({ status: "ok" });
   } catch (err) {
     logger.error({ err }, "Ошибка отправки в Telegram");
