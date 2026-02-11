@@ -96,7 +96,6 @@ function buildMessage(payload) {
     "",
     "Резюме диалога:",
     "",
-    `Имя гостя: ${resume.name || "—"}`,
     `Адрес: ${address || "—"}`,
     `Сколько человек: ${resume.people || "—"}`,
     `Дата и время: ${resume.dateTime || "—"}`,
